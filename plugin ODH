@@ -1,0 +1,488 @@
+-- ODH 2026 adapter. Embedded in every plugin; no downloads/dependencies.
+local ODHX = (function()
+    local X = { ready=false, silent=false, restoring=false, replay=true, records={}, byKey={}, data={version=1, controls={}}, external=false }
+    X.id, X.title, X.file = "BJP", "Bomb Jump+", "ODH_BJP_settings.json"
+    local host = odh_shared_plugins
+    assert(host and type(host.CreateTab)=="function", X.title .. ": load through the current Overdrive H plugin menu")
+    local env = {}
+    if type(getgenv)=="function" then local ok,g=pcall(getgenv); if ok and type(g)=="table" then env=g end end
+    local rd = type(readfile)=="function" and readfile or env.readfile
+    local wr = type(writefile)=="function" and writefile or env.writefile
+    local exists = type(isfile)=="function" and isfile or env.isfile
+    local http = game:GetService("HttpService")
+    local reported = {}
+    local function report(message)
+        if reported[message] then return end
+        reported[message]=true
+        warn("[" .. X.title .. "] " .. message)
+        if type(host.Notify)=="function" then pcall(host.Notify, X.title .. ": " .. message, 5) end
+    end
+    X.Report = report
+    local function finite(v) return type(v)=="number" and v==v and math.abs(v)<math.huge end
+    local function encode(v, depth)
+        depth=depth or 0
+        if depth>20 then error("settings nesting too deep") end
+        if typeof(v)=="Color3" then return {__odhColor={v.R,v.G,v.B}} end
+        local t=type(v)
+        if t=="boolean" or t=="string" then return v end
+        if t=="number" then if finite(v) then return v end; return nil end
+        if t=="table" then
+            local result={}
+            for k,item in pairs(v) do
+                if type(k)=="string" or type(k)=="number" then result[k]=encode(item,depth+1) end
+            end
+            return result
+        end
+        return nil -- never serialize Instances, connections, functions or players
+    end
+    local function decode(v, depth)
+        depth=depth or 0
+        if depth>20 then error("settings nesting too deep") end
+        if type(v)~="table" then return v end
+        if v.__odhColor then
+            local c=v.__odhColor
+            assert(type(c)=="table" and finite(c[1]) and finite(c[2]) and finite(c[3]),"invalid color")
+            return Color3.new(math.clamp(c[1],0,1),math.clamp(c[2],0,1),math.clamp(c[3],0,1))
+        end
+        local result={}
+        for k,item in pairs(v) do result[k]=decode(item,depth+1) end
+        return result
+    end
+    X.Encode, X.Decode = encode, decode
+    if not X.external then
+        if type(rd)=="function" and type(wr)=="function" then
+            local present=true
+            if type(exists)=="function" then local ok,v=pcall(exists,X.file); if ok then present=v end end
+            if present then
+                local ok,text=pcall(rd,X.file)
+                if ok then
+                    local good,data=pcall(function() return decode(http:JSONDecode(text)) end)
+                    if good and type(data)=="table" and data.version==1 and type(data.controls)=="table" then X.data=data
+                    else X.badFile=true; report("Invalid settings file; defaults loaded. A manual change will replace it.") end
+                elseif type(exists)=="function" then report("Could not read settings file: " .. tostring(text)); X.badFile=true end
+            end
+        else report("readfile/writefile unavailable; settings last only for this session.") end
+    end
+    local tab
+    X.shared=setmetatable({}, {__index=host}) -- never mutate the host API
+    X.shared.Notify=function(text,seconds)
+        if X.restoring then return end
+        if type(host.Notify)=="function" then return host.Notify(text,seconds or 3) end
+    end
+    local function key(section,name,kind) return section .. " / " .. kind .. " / " .. name end
+    local function safeValue(r,v)
+        if r.kind=="Toggle" then if type(v)=="boolean" then return v end
+        elseif r.kind=="Slider" then if finite(v) then return math.clamp(v,r.min,r.max) end
+        elseif r.kind=="Colorpicker" then if typeof(v)=="Color3" then return v end
+        elseif r.kind=="Dropdown" then
+            for _,item in ipairs(r.items) do if v==item then return v end end
+        end
+        return nil
+    end
+    local function show(r,v)
+        if v==nil or r.shown==v then return end
+        local prior=X.silent; X.silent=true
+        local ok,err=pcall(function()
+            if r.kind=="Toggle" then
+                if r.visual~=v then assert(type(r.handle)=="function","AddToggle must return a closure"); r.handle() end
+            elseif r.kind=="Slider" then r.handle:SetValue(v)
+            elseif r.kind=="Colorpicker" then r.handle:SetRGBValue(v)
+            elseif r.kind=="Dropdown" then r.handle:Select(v) end
+        end)
+        X.silent=prior
+        if ok then r.shown=v else report("UI sync failed: " .. r.name .. ": " .. tostring(err)) end
+    end
+    function X.Bind(section,name,kind,getter)
+        local r=X.byKey[key(section,name,kind)]
+        assert(r,"Unknown binding " .. section .. " / " .. name)
+        r.get=getter
+    end
+    function X.Sync()
+        for _,r in ipairs(X.records) do
+            if r.get then
+                local ok,v=pcall(r.get)
+                if ok then
+                    v=safeValue(r,v)
+                    if v~=nil then
+                        r.value=v
+                        if not r.exclude then X.data.controls[r.key]=v end
+                        show(r,v)
+                    end
+                end
+            end
+        end
+    end
+    function X.Commit()
+        if not X.ready or X.silent or X.restoring or X.stopped or X.committing then return end
+        X.committing=true
+        local ok,err=pcall(function()
+            X.Sync()
+            if X.capture then X.data.snapshot=X.capture() end
+            if X.external then
+                if not X.backend or not X.backend(X.data) then error("native settings file could not be saved") end
+            elseif type(wr)=="function" then
+                wr(X.file,http:JSONEncode(encode(X.data)))
+            end
+        end)
+        X.committing=false
+        if not ok then report("Settings save failed: " .. tostring(err)) end
+    end
+    function X.Restore()
+        X.restoring=true
+        -- Options before enabling modules. Actions and player selections are never replayed.
+        for _,togglePass in ipairs({false,true}) do
+            for _,r in ipairs(X.records) do
+                if not r.exclude and ((r.kind=="Toggle")==togglePass) then
+                    local v=safeValue(r,X.data.controls[r.key])
+                    if v==nil and r.get then local ok,x=pcall(r.get); if ok then v=safeValue(r,x) end end
+                    if v==nil then v=r.default end
+                    if v~=nil then
+                        show(r,v)
+                        local ok,err=pcall(r.callback,v)
+                        if not ok then report("Restore failed: " .. r.name .. ": " .. tostring(err)) end
+                        r.value=v; X.data.controls[r.key]=v
+                    end
+                end
+            end
+        end
+        X.restoring=false
+    end
+    function X.Finish()
+        if X.replay then X.Restore() else X.Sync() end
+        X.ready=true
+        if not X.badFile then X.Commit() end
+    end
+    function X.Set(section,name,kind,v,apply)
+        local r=X.byKey[key(section,name,kind)]
+        if not r then return end
+        v=safeValue(r,v); if v==nil then return end
+        show(r,v); r.value=v; X.data.controls[r.key]=v
+        if apply then r.callback(v) end
+    end
+    function X.ResetControls()
+        X.data.controls={}
+        for _,r in ipairs(X.records) do
+            if r.kind=="Toggle" and not r.exclude then X.Set(r.section,r.name,r.kind,false,true) end
+        end
+    end
+    function X.shared.AddSection(name,subtitle)
+        if not tab then tab=host.CreateTab(X.title,"/mellnikovden968-web/CFG_PM2/refs/heads/main/icon") end
+        local raw=tab:AddSection(name,subtitle or "")
+        local section={Name=name,Raw=raw}
+        local function register(kind,label,callback,default,min,max,items)
+            local r={section=name,name=label,kind=kind,callback=callback,default=default,min=min,max=max,items=items,visual=false}
+            r.key=key(name,label,kind)
+            r.exclude=(name=="🔑 Keys") -- key-capture toggles are actions, not enabled modes
+            X.records[#X.records+1]=r; X.byKey[r.key]=r
+            local function changed(v)
+                if kind=="Toggle" then r.visual=(v==true) end
+                if not X.ready or X.silent or X.restoring or X.stopped then return end
+                v=safeValue(r,v); if v==nil then return end
+                r.shown=v
+                local ok,err=pcall(callback,v)
+                if ok then
+                    r.value=v
+                    if not r.exclude then X.data.controls[r.key]=v end
+                    X.Commit()
+                else report("Callback failed: " .. label .. ": " .. tostring(err)) end
+            end
+            if kind=="Toggle" then r.handle=raw:AddToggle(label,changed)
+            elseif kind=="Slider" then r.handle=raw:AddSlider(label,min,max,default,changed)
+            elseif kind=="Colorpicker" then r.handle=raw:AddColorpicker(label,default,changed)
+            elseif kind=="Dropdown" then r.handle=raw:AddDropdown(label,items,changed) end
+            return r.handle
+        end
+        function section:AddToggle(label,cb) return register("Toggle",label,cb,false) end
+        function section:AddSlider(label,min,max,default,cb) return register("Slider",label,cb,default,min,max) end
+        function section:AddColorpicker(label,default,cb) return register("Colorpicker",label,cb,default) end
+        function section:AddDropdown(label,items,cb) return register("Dropdown",label,cb,items[1],nil,nil,items) end
+        local function action(cb)
+            return function(...)
+                if not X.ready or X.stopped then return end
+                local ok,err=pcall(cb,...)
+                if not ok then report("Action failed: " .. tostring(err)) end
+                X.Commit()
+            end
+        end
+        function section:AddButton(label,cb) return raw:AddButton(label,action(cb)) end
+        function section:AddKeybind(label,default,cb) return raw:AddKeybind(label,default,action(cb)) end
+        function section:AddPlayerDropdown(label,cb) return raw:AddPlayerDropdown(label,action(cb)) end
+        function section:AddTextBox(label,cb) return raw:AddTextBox(label,action(cb)) end
+        function section:AddLabel(...) return raw:AddLabel(...) end
+        function section:AddParagraph(...) return raw:AddParagraph(...) end
+        return section
+    end
+    -- Stable GUI paths, never serialized Instances. Player name is session-independent.
+    function X.Path(object)
+        local parts={}
+        local player=game:GetService("Players").LocalPlayer
+        while object and object~=game do
+            table.insert(parts,1,object==player and "$LocalPlayer" or object.Name)
+            object=object.Parent
+            if #parts>32 then return nil end
+        end
+        if object~=game then return nil end
+        return parts
+    end
+    function X.Resolve(parts)
+        if type(parts)~="table" then return nil end
+        local object=game
+        for _,name in ipairs(parts) do
+            if name=="$LocalPlayer" then object=game:GetService("Players").LocalPlayer
+            elseif type(name)=="string" and object then object=object:FindFirstChild(name)
+            else return nil end
+        end
+        return object
+    end
+    X.connections={}
+    function X.Connect(signal,callback)
+        local c=signal:Connect(function(...) if not X.stopped then return callback(...) end end)
+        X.connections[#X.connections+1]=c
+        return c
+    end
+    function X.Stop()
+        if X.stopped then return end
+        X.Commit()
+        X.stopped=true
+        for _,c in ipairs(X.connections) do pcall(function() c:Disconnect() end) end
+        if X.cleanup then pcall(X.cleanup) end
+    end
+    local registry=rawget(_G,"ODH_2026_PluginRuntimes")
+    if type(registry)~="table" then registry={}; rawset(_G,"ODH_2026_PluginRuntimes",registry) end
+    local previous=registry[X.id]
+    if previous and type(previous.Stop)=="function" then pcall(previous.Stop) end
+    registry[X.id]=X
+    return X
+end)()
+-- END ODH 2026 ADAPTER
+
+local table_insert = table.insert
+
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new() 
+    return setmetatable({_tasks = {}, _destroyed = false}, Maid) 
+end
+
+function Maid:GiveTask(task)
+    if self._destroyed then
+        self:_cleanupTask(task)
+        return
+    end
+    table_insert(self._tasks, task)
+    return task
+end
+
+function Maid:GiveTasks(...)
+    for _, task in ipairs({...}) do
+        self:GiveTask(task)
+    end
+end
+
+function Maid:_cleanupTask(task)
+    local taskType = typeof(task)
+    if taskType == "RBXScriptConnection" then
+        task:Disconnect()
+    elseif taskType == "Instance" then
+        task:Destroy()
+    elseif taskType == "function" then
+        task()
+    elseif taskType == "table" and type(task.Destroy) == "function" then
+        task:Destroy()
+    end
+end
+
+function Maid:DoCleaning()
+    if self._destroyed then return end
+    self._destroyed = true
+    for _, task in ipairs(self._tasks) do
+        self:_cleanupTask(task)
+    end
+    self._tasks = {}
+end
+
+function Maid:Destroy() 
+    self:DoCleaning() 
+end
+
+local RootMaid = Maid.new()
+
+local shared = ODHX.shared
+
+local Services = {
+    Players = game:GetService("Players"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    RunService = game:GetService("RunService"),
+    UserInputService = game:GetService("UserInputService"),
+    StarterGui = game:GetService("StarterGui"),
+    CoreGui = game:GetService("CoreGui"),
+    Workspace = game:GetService("Workspace"),
+    TweenService = game:GetService("TweenService"),
+    SoundService = game:GetService("SoundService")
+}
+
+local LocalPlayer = Services.Players.LocalPlayer
+
+local __PCLR = Color3.new
+local __RGB = Color3.fromRGB
+local __UD2 = UDim2.new
+local __UD = UDim.new
+local __V2 = Vector2.new
+
+local function getfserv(s)
+    local ok, svc = pcall(function() return game:GetService(s) end)
+    if ok and svc then return svc end
+    ok, svc = pcall(function() return game:FindService(s) end)
+    if ok and svc then return svc end
+    return game[s]
+end
+
+local __RS   = getfserv("RunService")
+local __UIS  = getfserv("UserInputService")
+local __PLRS = getfserv("Players")
+local __TS   = getfserv("TweenService")
+
+local BBSystem = {Buttons = {}, Connections = {}}
+
+local function bb_safecallback(callback)
+    if not callback then return end
+    local ok, err = xpcall(callback, function(e) return debug.traceback(e) end)
+    if not ok then warn("[BB ERROR] " .. tostring(err)) end
+end
+
+local function BB_GetStorage()
+    local parent = gethui and gethui()
+    if not parent or typeof(parent) ~= "Instance" then
+        parent = getfserv("CoreGui")
+    end
+    if not parent or typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui", 5)
+    end
+    if typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local sg = parent:FindFirstChild("@odh_bjp_bigstorage")
+    if not sg then
+        sg = Instance.new("ScreenGui")
+        sg.Name = "@odh_bjp_bigstorage"
+        sg.ResetOnSpawn = false
+        sg.IgnoreGuiInset = true
+        pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
+        sg.Parent = parent
+    end
+    return sg
+end
+
+local __BB_GRAD_SEQ = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,    __PCLR(0.0784314, 0.0784314, 0.0784314)),
+    ColorSequenceKeypoint.new(0.75, __PCLR(0.0784314, 0.0784314, 0.54902)),
+    ColorSequenceKeypoint.new(1,    __PCLR(0.470588,  0.156863,  0.470588))
+})
+
+local function BB_MakeDraggable(gui, func, ripple, sound)
+    local dragging, dragInput, dragStart, startPos
+    local hasMoved = false
+    local tInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local normalSize    = __UD2(0, 200, 0, 75)
+    local normalTxtSize = 24
+    local bigSize       = __UD2(0, 220, 0, 82.5)
+    local bigTxtSize    = 26.4
+
+    ODHX.Connect(gui.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            hasMoved  = false
+            dragStart = input.Position
+            startPos  = gui.Position
+            __TS:Create(gui, tInfo, {Size = bigSize, TextSize = bigTxtSize}):Play()
+            local absPos = gui.AbsolutePosition
+            ripple.Position = __UD2(0, input.Position.X - absPos.X, 0, input.Position.Y - absPos.Y)
+            ripple.Size = __UD2(0, 0, 0, 0)
+            ripple.BackgroundTransparency = 0.5
+            ripple.Visible = true
+            sound:Play()
+            __TS:Create(ripple, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+                Size = __UD2(0, 300, 0, 300),
+                BackgroundTransparency = 1
+            }):Play()
+            local rel
+            rel = ODHX.Connect(__UIS.InputEnded, function(endInput)
+                if endInput.UserInputType == input.UserInputType then
+                    dragging = false
+                    __TS:Create(gui, tInfo, {Size = normalSize, TextSize = normalTxtSize}):Play()
+                    if not hasMoved then bb_safecallback(func) end
+                    rel:Disconnect()
+                end
+            end)
+        end
+    end)
+    ODHX.Connect(gui.InputChanged, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    ODHX.Connect(__UIS.InputChanged, function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 7 then hasMoved = true end
+            gui.Position = __UD2(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+local BindableButtons
+local muteButtonSounds = false
+
+local function UpdateAllButtonSounds()
+    local volume = muteButtonSounds and 0 or 0.5
+    for id, btn in pairs(BBSystem.Buttons) do
+        local sound = btn:FindFirstChild("Sound")
+        if sound then
+            sound.Volume = volume
+        end
+    end
+    for id, btn in pairs(BindableButtons.Buttons) do
+        local sound = btn:FindFirstChild("Sound")
+        if sound then
+            sound.Volume = volume
+        end
+    end
+end
+
+local function AddBigButton(id, text, func, isGold, customSize)
+    if BBSystem.Buttons[id] then return end
+    local storage = BB_GetStorage()
+    local bb = Instance.new("TextButton")
+    bb.Name = id
+    bb.Size = customSize or __UD2(0, 200, 0, 75)
+    bb.Position = __UD2(0.5, 0, 0.5, 0)
+    bb.AnchorPoint = __V2(0.5, 0.5)
+    bb.BackgroundColor3 = __RGB(255, 255, 255)
+    bb.BackgroundTransparency = 0.9
+    bb.BorderSizePixel = 0
+    bb.Font = Enum.Font.Jura
+    bb.Text = text
+    bb.TextSize = 24
+    bb.TextColor3 = __RGB(255, 255, 255)
+    bb.TextWrapped = true
+    bb.ClipsDescendants = true
+    bb.AutoButtonColor = false
+    bb.ZIndex = 5
+    bb.Parent = storage
+
+    Instance.new("UICorner", bb).CornerRadius = __UD(0, 5)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = __RGB(255, 255, 255)
+    stroke.Thickness = 1.5
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = bb
+    local gradient = Instance.new("UIGradient")
+    
+    if isGold then
+        gradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0,    __RGB(255, 215, 0)),
+            ColorSequenceKeypoint.new(0.5,  __RGB(255, 140, 0)),
+            ColorSequenceKeypoint.new(1,    __RGB(184, 134, 11))
+ 
